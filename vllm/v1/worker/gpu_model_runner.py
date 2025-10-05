@@ -15,6 +15,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tqdm import tqdm
+import pdb
 
 import vllm.envs as envs
 from vllm.attention import Attention, AttentionType
@@ -2002,137 +2003,145 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
-        with record_function_or_nullcontext("Preprocess"):
-            self._update_states(scheduler_output)
-            if not scheduler_output.total_num_scheduled_tokens:
-                if not has_kv_transfer_group():
-                    # Return empty ModelRunnerOutput if there's no work to do.
+        with record_function_or_nullcontext("Preprocess"):  # 预处理阶段，记录函数调用
+            self._update_states(scheduler_output)  # 更新内部状态
+            if not scheduler_output.total_num_scheduled_tokens:  # 如果没有需要调度的token
+                if not has_kv_transfer_group():  # 检查是否有KV传输组
+                    # 如果没有工作需要做，返回空的ModelRunnerOutput
                     return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output,
+                return self.kv_connector_no_forward(scheduler_output,  # KV直连，无forward
                                                     self.vllm_config)
-            if self.cache_config.kv_sharing_fast_prefill:
-                assert not self.input_batch.num_prompt_logprobs, (
+            if self.cache_config.kv_sharing_fast_prefill:  # KV共享快速预填充模式
+                assert not self.input_batch.num_prompt_logprobs, (  # 禁止请求prompt logprobs
                     "--kv-sharing-fast-prefill produces incorrect logprobs for "
                     "prompt tokens, tokens, please disable it when the requests"
                     " need prompt logprobs")
 
-            if self.prepare_inputs_event is not None:
-                # Ensure prior step has finished with reused CPU tensors.
+            if self.prepare_inputs_event is not None:  # 如果有输入准备事件
+                # 确保前一步复用的CPU张量已完成
                 self.prepare_inputs_event.synchronize()
             try:
-                # Prepare the decoder inputs.
+                # 准备解码器输入
                 (attn_metadata, logits_indices, spec_decode_metadata,
                  num_scheduled_tokens_np, spec_decode_common_attn_metadata,
                  max_query_len) = self._prepare_inputs(scheduler_output)
 
             finally:
                 if self.prepare_inputs_event is not None:
-                    self.prepare_inputs_event.record()
+                    self.prepare_inputs_event.record()  # 记录事件
 
             (
-                num_scheduled_tokens,
-                num_input_tokens,
-                num_tokens_across_dp,
-                input_ids,
-                inputs_embeds,
-                positions,
-                intermediate_tensors,
-                model_kwargs,
-            ) = self._preprocess(scheduler_output, intermediate_tensors)
+                num_scheduled_tokens,  # 本次调度的token数
+                num_input_tokens,      # 输入token数
+                num_tokens_across_dp,  # DP并行下的token数
+                input_ids,             # 输入token id
+                inputs_embeds,         # 输入embedding
+                positions,             # 位置编码
+                intermediate_tensors,  # 中间张量
+                model_kwargs,          # 传递给模型的参数
+            ) = self._preprocess(scheduler_output, intermediate_tensors)  # 预处理输入
 
             uniform_decode = (max_query_len
                               == self.uniform_decode_query_len) and (
                                   num_scheduled_tokens
-                                  == self.input_batch.num_reqs * max_query_len)
+                                  == self.input_batch.num_reqs * max_query_len)  # 判断是否为统一解码
             batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens,
-                                               uniform_decode=uniform_decode)
+                                               uniform_decode=uniform_decode)  # 构造batch描述符
             cudagraph_runtime_mode, batch_descriptor = \
-                self.cudagraph_dispatcher.dispatch(batch_descriptor)
+                self.cudagraph_dispatcher.dispatch(batch_descriptor)  # CUDA图调度
 
-        # Run the model.
-        # Use persistent buffers for CUDA graphs.
+        # 运行模型
+        # 使用CUDA图的持久缓冲区
         with (set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_input_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_descriptor,
-        ), record_function_or_nullcontext("Forward"),
+                attn_metadata,  # 注意力元数据
+                self.vllm_config,  # 配置
+                num_tokens=num_input_tokens,  # 输入token数
+                num_tokens_across_dp=num_tokens_across_dp,  # DP下token数
+                cudagraph_runtime_mode=cudagraph_runtime_mode,  # CUDA图模式
+                batch_descriptor=batch_descriptor,  # batch描述符
+        ), record_function_or_nullcontext("Forward"),  # 前向阶段
               self.maybe_get_kv_connector_output(scheduler_output) as
-              kv_connector_output):
+              kv_connector_output):  # KV connector输出
+            # logger.warn(f'[------------xxxx------------] \n'
+            #             f'input_ids: {input_ids.shape if input_ids is not None else None}, \n'
+            #             f'inputs_embeds: {inputs_embeds.shape if inputs_embeds is not None else None}\n'
+            #             f'positions: {positions.shape if positions is not None else None}\n'
+            #             f'attn_metadata: {attn_metadata}\n'
+            #             f'model_kwargs: {model_kwargs}\n'
+            #     )                              
+            # pdb.set_trace()
             model_output = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+                input_ids=input_ids,  # 输入token id
+                positions=positions,  # 位置编码
+                intermediate_tensors=intermediate_tensors,  # 中间张量
+                inputs_embeds=inputs_embeds,  # 输入embedding
+                **model_kwargs,  # 其他参数
+            )  # 执行模型前向
 
-        with record_function_or_nullcontext("Postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, aux_hidden_states = model_output
+        with record_function_or_nullcontext("Postprocess"):  # 后处理阶段
+            if self.use_aux_hidden_state_outputs:  # 是否有辅助hidden state输出
+                hidden_states, aux_hidden_states = model_output  # 拆分主/辅助hidden state
             else:
-                hidden_states = model_output
+                hidden_states = model_output  # 只有主hidden state
                 aux_hidden_states = None
 
-            # Broadcast PP output for external_launcher (torchrun)
-            # to make sure we are synced across pp ranks
-            # TODO: Support overlapping mirco-batches
+            # PP（Pipeline Parallel）输出广播，适配external_launcher（如torchrun）
+            # 保证pp rank间同步
+            # TODO: 支持微批次重叠
             # https://github.com/vllm-project/vllm/issues/18019
             broadcast_pp_output = \
                 self.parallel_config.distributed_executor_backend \
-                == "external_launcher" and len(get_pp_group().ranks) > 0
-            if not get_pp_group().is_last_rank:
-                # For mid-pipeline stages, return the hidden states.
+                == "external_launcher" and len(get_pp_group().ranks) > 0  # 是否需要广播PP输出
+            if not get_pp_group().is_last_rank:  # 非最后一个PP rank
+                # 中间阶段返回hidden states
                 assert isinstance(hidden_states, IntermediateTensors)
                 if not broadcast_pp_output:
-                    hidden_states.kv_connector_output = kv_connector_output
-                    return hidden_states
+                    hidden_states.kv_connector_output = kv_connector_output  # 附加KV connector输出
+                    return hidden_states  # 直接返回hidden states
                 get_pp_group().send_tensor_dict(
-                    hidden_states.tensors, all_gather_group=get_tp_group())
-                logits = None
+                    hidden_states.tensors, all_gather_group=get_tp_group())  # 广播hidden states
+                logits = None  # logits置空
             else:
-                if self.is_pooling_model:
+                if self.is_pooling_model:  # 如果是pooling模型
                     return self._pool(hidden_states, num_scheduled_tokens,
                                       num_scheduled_tokens_np,
-                                      kv_connector_output)
+                                      kv_connector_output)  # 执行pooling并返回
 
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states, None)
-            if broadcast_pp_output:
+                sample_hidden_states = hidden_states[logits_indices]  # 采样hidden states
+                logits = self.model.compute_logits(sample_hidden_states, None)  # 计算logits
+            if broadcast_pp_output:  # 如果需要广播logits
                 model_output_broadcast_data = {
-                    "logits": logits.contiguous(),
+                    "logits": logits.contiguous(),  # logits转为连续
                 } if logits is not None else {}
                 model_output_broadcast_data = get_pp_group(
                 ).broadcast_tensor_dict(model_output_broadcast_data,
-                                        src=len(get_pp_group().ranks) - 1)
+                                        src=len(get_pp_group().ranks) - 1)  # 广播logits
                 assert model_output_broadcast_data is not None
-                logits = model_output_broadcast_data["logits"]
+                logits = model_output_broadcast_data["logits"]  # 获取广播后的logits
 
-            # Apply structured output bitmasks if present
+            # 如果有结构化输出bitmask则应用
             if scheduler_output.grammar_bitmask is not None:
-                self.apply_grammar_bitmask(scheduler_output, logits)
+                self.apply_grammar_bitmask(scheduler_output, logits)  # 应用grammar bitmask
 
-        with record_function_or_nullcontext("Sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+        with record_function_or_nullcontext("Sample"):  # 采样阶段
+            sampler_output = self._sample(logits, spec_decode_metadata)  # 采样下一个token
 
-        with record_function_or_nullcontext("Bookkeep"):
+        with record_function_or_nullcontext("Bookkeep"):  # 记账/同步阶段
             (
-                num_nans_in_logits,
-                logprobs_lists,
-                valid_sampled_token_ids,
-                prompt_logprobs_dict,
-                req_ids_output_copy,
-                req_id_to_index_output_copy,
-                invalid_req_indices,
+                num_nans_in_logits,  # logits中的NaN数量
+                logprobs_lists,      # logprobs列表
+                valid_sampled_token_ids,  # 有效采样token id
+                prompt_logprobs_dict,     # prompt logprobs字典
+                req_ids_output_copy,      # 请求id副本
+                req_id_to_index_output_copy,  # 请求id到索引副本
+                invalid_req_indices,      # 无效请求索引
             ) = self._bookkeeping_sync(scheduler_output, sampler_output,
                                        logits, hidden_states,
-                                       num_scheduled_tokens)
+                                       num_scheduled_tokens)  # 记账同步
 
-        if self.speculative_config:
+        if self.speculative_config:  # 如果启用推理加速（speculative）
             assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("Draft"):
+            with record_function_or_nullcontext("Draft"):  # 草稿token阶段
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     valid_sampled_token_ids,
@@ -2142,31 +2151,31 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     aux_hidden_states,
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
-                )
+                )  # 生成draft token ids
 
-        with record_function_or_nullcontext("EPLB"):
-            self.eplb_step()
+        with record_function_or_nullcontext("EPLB"):  # 专家并行负载均衡阶段
+            self.eplb_step()  # 执行EPLB步骤
 
         output = ModelRunnerOutput(
-            req_ids=req_ids_output_copy,
-            req_id_to_index=req_id_to_index_output_copy,
-            sampled_token_ids=valid_sampled_token_ids,
-            logprobs=logprobs_lists,
-            prompt_logprobs_dict=prompt_logprobs_dict,
-            pooler_output=[],
-            kv_connector_output=kv_connector_output,
-            num_nans_in_logits=num_nans_in_logits,
-        )
+            req_ids=req_ids_output_copy,  # 请求id
+            req_id_to_index=req_id_to_index_output_copy,  # 请求id到索引
+            sampled_token_ids=valid_sampled_token_ids,  # 采样token id
+            logprobs=logprobs_lists,  # logprobs
+            prompt_logprobs_dict=prompt_logprobs_dict,  # prompt logprobs
+            pooler_output=[],  # pooling输出
+            kv_connector_output=kv_connector_output,  # KV connector输出
+            num_nans_in_logits=num_nans_in_logits,  # logits中的NaN数量
+        )  # 构造输出
 
-        if not self.use_async_scheduling:
-            return output
+        if not self.use_async_scheduling:  # 非异步调度
+            return output  # 返回同步输出
 
         return AsyncGPUModelRunnerOutput(
-            model_runner_output=output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-        )
+            model_runner_output=output,  # 同步输出
+            sampled_token_ids=sampler_output.sampled_token_ids,  # 采样token id
+            invalid_req_indices=invalid_req_indices,  # 无效请求索引
+            async_output_copy_stream=self.async_output_copy_stream,  # 异步输出流
+        )  # 返回异步输出
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         if self._draft_token_ids is None:

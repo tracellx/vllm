@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
+g_index = 0
+
 create_block_mask_compiled = torch.compile(create_block_mask,
                                            fullgraph=True,
                                            mode="reduce-overhead")
@@ -701,8 +703,24 @@ class FlexAttentionImpl(AttentionImpl):
             raise NotImplementedError(
                 "fused output quantization is not yet supported"
                 " for FlexAttentionImpl")
+       
 
         enable_gqa = self.num_kv_heads != self.num_heads
+        
+        global g_index
+        g_index += 1
+        logger.warning(f"[------------ forward:{g_index}----------]"
+                    f"query shape: {query.shape},"
+                    f"key shape: {key.shape},"
+                    f"value shape: {value.shape},"
+                    f"kv_cache shape: {kv_cache.shape},"
+                    f"output shape: {output.shape},"
+                    f"attn_metadata: {attn_metadata},"
+                    f"enable_gqa: {enable_gqa},"
+                    f"self.num_kv_heads: {self.num_kv_heads},"
+                    f"self.num_heads: {self.num_heads}"
+                    )
+        
 
         if attn_metadata is None:
             # Profiling run.
